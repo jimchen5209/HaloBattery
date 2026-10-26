@@ -51,6 +51,18 @@ later screen-off report showed that dropping the icon also cost it its tray posi
 (Windows puts a re-created icon at a new spot), so the greyed value no longer
 expires on a timer.
 
+The iRocks M31R (14a5:c009 on its 2.4 GHz receiver, 14a5:c010 on the cable; both read on
+real hardware under Windows, against the vendor software) speaks the same frame over a
+different transport. Its command collection (ff02:0002, feature report length 17) has no
+output report, so the request goes out as a FEATURE report there, and the reply comes back
+as an input report on another collection, ff01:0000 (input length 17). The reply header is
+0x08 or 0x09 (the mice seen so far answer 0x09, and the checksum counts it), the checksum
+must match, and a reply with another command is skipped: 0x03 is the vendor software's
+pairing probe, which is not sent here, and 0x0a is an event. The level (byte 6) and the
+charging flag (byte 7) were checked against the vendor software. Bytes 8-9 are always 0 on
+this model - it has no millivolt field, so none is read - and byte 5 (usually 0x02) is
+unknown and unused. Every other vendor id keeps the single 0x08 header and the output report.
+
 Frames are 17 bytes, big-endian, report id 0x08:
 
     [0] 0x08      header, which is also the report id
@@ -59,7 +71,7 @@ Frames are 17 bytes, big-endian, report id 0x08:
     [16] checksum 0x55 - the sum of bytes 0..15, mod 256
 
 A power reply carries the level in byte 6, the power flag in byte 7 (the mouse is on
-its cable) and millivolts big-endian in bytes 8-9. The same endpoint also pushes
+its cable) and millivolts big-endian in bytes 8-9 (not on the M31R). The same endpoint also pushes
 events (command 0x0a), so a reply is only accepted when the header and the checksum
 both check out, the command is the one we asked for, and the level is 0..100.
 """
@@ -83,6 +95,14 @@ CHECKSUM_BASE = 0x55
 LEVEL_INDEX = 6
 POWER_INDEX = 7
 VOLTAGE_SLICE = (8, 10)
+
+# iRocks M31R (vendor id 0x14A5): the request is a feature report on one collection and the
+# reply an input report on another; replies may carry header 0x09 as well as 0x08
+IROCKS_VID = 0x14A5
+IROCKS_COMMAND_USAGE = (0xFF02, 0x0002)    # feature length 17, no output report
+IROCKS_REPLY_USAGE = (0xFF01, 0x0000)      # input length 17
+REPLY_HEADERS: Dict[int, Tuple[int, ...]] = {IROCKS_VID: (PAYLOAD_HEADER, 0x09)}
+IROCKS_READ_ATTEMPTS = 8        # events and other commands are skipped, so allow a few more
 
 CONTROL_INTERFACE = 1           # the tool reads its 17-byte replies on interface 1
 CONTROL_USAGE = (0xFF02, 0x0002)   # the collection the OpenMouse ATK/VXE panel opens
@@ -171,6 +191,10 @@ PIDS: Dict[int, Dict[int, str]] = {
         0x5406: "Pulsar X2 CrazyLight Mini (2.4 GHz)",
         0x3414: "Pulsar X2 CrazyLight Mini (wired)",
     },
+    IROCKS_VID: {
+        0xC009: "iRocks M31R (2.4 GHz)",
+        0xC010: "iRocks M31R (wired)",
+    },
 }
 
 
@@ -184,12 +208,13 @@ def make_request() -> List[int]:
     return frame
 
 
-def parse_power(r) -> Optional[Tuple[int, bool]]:
-    """(percent, power flag) from a power reply, or None when this is not one."""
+def parse_power(r, vid: Optional[int] = None) -> Optional[Tuple[int, bool]]:
+    """(percent, power flag) from a power reply, or None when this is not one.
+    vid picks the headers a reply may carry (REPLY_HEADERS); the default is 0x08 only."""
     if not r or len(r) < PAYLOAD_LEN:
         return None
     frame = list(r[:PAYLOAD_LEN])
-    if frame[0] != PAYLOAD_HEADER or frame[1] != CMD_POWER:
+    if frame[0] not in REPLY_HEADERS.get(vid, (PAYLOAD_HEADER,)) or frame[1] != CMD_POWER:
         return None
     if frame[PAYLOAD_LEN - 1] != checksum(frame[:PAYLOAD_LEN - 1]):
         return None
@@ -250,6 +275,20 @@ class PulsarProvider(Provider):
                           f"falling back to the first of {len(infos)}")
         return infos[0] if infos else None
 
+    def _read_reply(self, dev, vid: Optional[int] = None,
+                    attempts: int = READ_ATTEMPTS) -> Optional[List[int]]:
+        """The first power reply from dev; events and other frames are skipped."""
+        for attempt in range(attempts):
+            r = dev.read(PAYLOAD_LEN, READ_TIMEOUT_MS)
+            if not r:
+                break
+            self._diag.append(f"  reply {attempt + 1}: {hexdump(r)}")
+            if parse_power(r, vid) is not None:
+                return list(r)
+            time.sleep(0.02)
+        self._diag.append("  no power reply (events and short frames are ignored)")
+        return None
+
     def _query(self, path: bytes) -> Optional[List[int]]:
         dev = hid.device()
         try:
@@ -260,16 +299,7 @@ class PulsarProvider(Provider):
         try:
             self._drain(dev)
             dev.write(make_request())
-            for attempt in range(READ_ATTEMPTS):
-                r = dev.read(PAYLOAD_LEN, READ_TIMEOUT_MS)
-                if not r:
-                    break
-                self._diag.append(f"  reply {attempt + 1}: {hexdump(r)}")
-                if parse_power(r) is not None:
-                    return list(r)
-                time.sleep(0.02)
-            self._diag.append("  no power reply (events and short frames are ignored)")
-            return None
+            return self._read_reply(dev)
         except (OSError, IOError, ValueError) as e:
             self._diag.append(f"  query error: {e}")
             return None
@@ -278,6 +308,44 @@ class PulsarProvider(Provider):
                 dev.close()
             except Exception:
                 pass
+
+    def _query_feature(self, infos: List[dict]) -> Optional[List[int]]:
+        """iRocks M31R: the request as a feature report on ff02:0002, the reply read
+        from the input reports of ff01:0000."""
+        command = next((d for d in infos
+                        if (d.get("usage_page"), d.get("usage")) == IROCKS_COMMAND_USAGE), None)
+        replies = next((d for d in infos
+                        if (d.get("usage_page"), d.get("usage")) == IROCKS_REPLY_USAGE), None)
+        if command is None or replies is None:
+            self._diag.append("  needs the ff02:0002 and ff01:0000 collections; "
+                              f"{'ff02:0002' if command is None else 'ff01:0000'} not found")
+            return None
+        opened = []
+        try:
+            for d in (replies, command):
+                dev = hid.device()
+                try:
+                    dev.open_path(d["path"])
+                except (OSError, IOError) as e:
+                    self._diag.append(f"  open: {e}")
+                    return None
+                opened.append(dev)
+            reader, writer = opened
+            self._drain(reader)
+            n = writer.send_feature_report(make_request())
+            if n is not None and n < 0:
+                self._diag.append("  send: refused")
+                return None
+            return self._read_reply(reader, IROCKS_VID, IROCKS_READ_ATTEMPTS)
+        except (OSError, IOError, ValueError) as e:
+            self._diag.append(f"  query error: {e}")
+            return None
+        finally:
+            for dev in opened:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
 
     def _drain(self, dev) -> None:
         for _ in range(4):
@@ -302,22 +370,26 @@ class PulsarProvider(Provider):
                     continue
                 key = f"pulsar:{vid:04x}{pid:04x}"
                 present.add(key)
-                d = self._pick(mine)
-                if d is None:
-                    continue
                 name = pids[pid]
-                self._diag.append(f"[Pulsar] pid={vid:04x}:{pid:04x} '{name}' "
-                                  f"iface={d.get('interface_number')} "
-                                  f"{d.get('usage_page', 0):04x}:{d.get('usage', 0):04x}"
-                                  f" output={output_length(d['path'])}")
-                reply = self._query(d["path"])
-                parsed = parse_power(reply)
+                if vid == IROCKS_VID:
+                    self._diag.append(f"[Pulsar] pid={vid:04x}:{pid:04x} '{name}'")
+                    reply = self._query_feature(mine)
+                else:
+                    d = self._pick(mine)
+                    if d is None:
+                        continue
+                    self._diag.append(f"[Pulsar] pid={vid:04x}:{pid:04x} '{name}' "
+                                      f"iface={d.get('interface_number')} "
+                                      f"{d.get('usage_page', 0):04x}:{d.get('usage', 0):04x}"
+                                      f" output={output_length(d['path'])}")
+                    reply = self._query(d["path"])
+                parsed = parse_power(reply, vid)
                 if parsed is None:
                     if not reply:
                         self._diag.append("    no reply (asleep, or the mouse is idle)")
                     continue
                 level, on_cable = parsed
-                mv = voltage_mv(reply)
+                mv = None if vid == IROCKS_VID else voltage_mv(reply)   # the M31R has none
                 if mv:
                     self._diag.append(f"  {mv} mV")
                 self._last[key] = (name, level, on_cable, now)

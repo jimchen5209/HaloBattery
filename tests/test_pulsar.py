@@ -18,6 +18,10 @@ The Hitscan Hyperlight (3770:0200 on its receiver, 3770:0100 on the cable, #105)
 faked with its own collection list and the frames sopparus/hitscan-battery captured
 from the vendor application; the same rule picks its ff02:0002 collection.
 
+The iRocks M31R (14a5:c009 on the receiver, 14a5:c010 on the cable) is faked with the
+collections its Windows report lists and the frames that were read from it on real hardware:
+the request is a feature report on ff02:0002 and the reply is an input report on ff01:0000.
+
 hidlist.enumerate() and hid.device() are replaced: the real ones ask Windows for
 collections of real devices.
 
@@ -257,6 +261,8 @@ class PulsarTest(unittest.TestCase):
 
     def test_every_claimed_id_answers_the_same_request(self):
         for vid, pids in P.PIDS.items():
+            if vid == P.IROCKS_VID:
+                continue          # its request is a feature report: M31RTest below
             for pid in pids:
                 with self.subTest(vid=vid, pid=pid):
                     bus = FakeBus(vid, pid, [reply(33)])
@@ -417,6 +423,260 @@ class PulsarTest(unittest.TestCase):
         diag = "\n".join(provider.diagnostics())
         self.assertIn("did not answer", diag)
         self.assertIn("greyed", diag)
+
+
+# ------------------------------------------------------------------ iRocks M31R
+
+# the 17-byte frames read from the mouse on real hardware under Windows
+M31R_55 = bytes.fromhex("09 04 00 00 00 02 37 00 00 00 00 00 00 00 00 00 0f")     # 55 %, not charging
+M31R_75_CHARGING = bytes.fromhex("09 04 00 00 00 02 4b 01 00 00 00 00 00 00 00 00 fa")
+M31R_70_WIRED = bytes.fromhex("09 04 00 00 00 02 46 01 00 00 00 00 00 00 00 00 ff")
+M31R_PAIR_REPLY = bytes.fromhex("09 03 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00")
+M31R_REQUEST = bytes.fromhex("08 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 49")
+
+# the collections of the receiver, plus the keyboard and the mouse that must never be opened
+M31R_SHAPE = [
+    (1, 0xFF02, 0x0002),    # commands: feature report of 17 bytes
+    (1, 0xFF01, 0x0000),    # replies: input report of 17 bytes
+    (1, 0xFF03, 0x0000),
+    (1, 0xFF04, 0x0002),
+    (1, 0x000C, 0x0001),
+    (1, 0x0001, 0x0080),
+    (0, 0x0001, 0x0006),
+    (2, 0x0001, 0x0002),
+]
+M31R_RECEIVER, M31R_CABLE = 0xC009, 0xC010
+
+
+class FakeM31R:
+    """One or two M31R on the bus. A valid power request (a feature report on ff02:0002)
+    is answered by queueing that device's script on its ff01:0000 collection; a frame with
+    a bad checksum is ignored, and the command collection has no output report."""
+
+    def __init__(self, scripts):
+        self.scripts = {pid: list(frames) for pid, frames in scripts.items()}
+        self.queues = {pid: [] for pid in scripts}
+        self.cols = {}            # path -> (pid, usage page, usage)
+        self.sent = []            # (pid, frame) for every feature report
+        self.opened = []          # (pid, usage page, usage)
+        self.written = []         # output reports (there is no output report to take them)
+        self.refuse_feature = False
+        for pid in scripts:
+            for i, (iface, page, usage) in enumerate(M31R_SHAPE):
+                path = b"\\\\?\\hid#vid_14a5&pid_%04x#col%02d" % (pid, i)
+                self.cols[path] = (pid, page, usage)
+
+    def enumerate(self, vid):
+        if vid != P.IROCKS_VID:
+            return []
+        out = []
+        for path, (pid, page, usage) in self.cols.items():
+            iface = next(i for i, p, u in M31R_SHAPE if (p, u) == (page, usage))
+            out.append({"path": path, "interface_number": iface, "usage_page": page,
+                        "usage": usage, "product_id": pid, "vendor_id": vid})
+        return out
+
+    def device_class(self):
+        bus = self
+
+        class FakeDevice:
+            def open_path(self, path):
+                self.pid, self.page, self.usage = bus.cols[path]
+                bus.opened.append(bus.cols[path])
+
+            def send_feature_report(self, frame):
+                if (self.page, self.usage) != (0xFF02, 0x0002):
+                    raise OSError("no feature report here")
+                frame = list(frame)
+                bus.sent.append((self.pid, frame))
+                if bus.refuse_feature:
+                    return -1
+                if len(frame) == 17 and frame[1] == 0x04 and sum(frame) & 0xFF == 0x55:
+                    bus.queues[self.pid].extend(bus.scripts[self.pid])
+                return len(frame)
+
+            def get_feature_report(self, report_id, length):
+                return bytes(length)          # all zeros: no use as a reply
+
+            def write(self, frame):
+                bus.written.append(list(frame))
+                raise OSError("write error")  # the command collection has no output report
+
+            def read(self, length, timeout_ms=0):
+                if (self.page, self.usage) == (0xFF02, 0x0002):
+                    raise OSError("read error")
+                if (self.page, self.usage) != (0xFF01, 0x0000):
+                    return b""
+                queue = bus.queues[self.pid]
+                return queue.pop(0) if queue else b""
+
+            def close(self):
+                pass
+
+        return FakeDevice
+
+
+class M31RTest(unittest.TestCase):
+    def setUp(self):
+        self._hid, self._hidlist = P.hid, P.hidlist
+
+    def tearDown(self):
+        P.hid, P.hidlist = self._hid, self._hidlist
+
+    def bus(self, scripts):
+        bus = FakeM31R(scripts)
+        P.hidlist = types.SimpleNamespace(enumerate=bus.enumerate)
+        P.hid = types.SimpleNamespace(device=bus.device_class())
+        return bus
+
+    def poll(self, scripts):
+        bus = self.bus(scripts)
+        provider = P.PulsarProvider()
+        return provider.poll(), bus, provider
+
+    def test_the_real_frames_parse(self):
+        self.assertEqual((55, False), P.parse_power(M31R_55, P.IROCKS_VID))
+        self.assertEqual((75, True), P.parse_power(M31R_75_CHARGING, P.IROCKS_VID))
+        self.assertEqual((70, True), P.parse_power(M31R_70_WIRED, P.IROCKS_VID))
+
+    def test_the_receiver_is_read_55_percent_not_charging(self):
+        found, bus, _ = self.poll({M31R_RECEIVER: [M31R_55]})
+        self.assertEqual(1, len(found))
+        d = found[0]
+        self.assertEqual(("pulsar:14a5c009", "iRocks M31R (2.4 GHz)", 55, False, True, "mouse"),
+                         (d.key, d.name, d.level, d.charging, d.online, d.kind))
+
+    def test_a_charging_mouse_is_read_75_percent(self):
+        found, _, _ = self.poll({M31R_RECEIVER: [M31R_75_CHARGING]})
+        self.assertEqual((75, True), (found[0].level, found[0].charging))
+
+    def test_the_cable_is_read_70_percent_under_its_own_name(self):
+        found, _, _ = self.poll({M31R_CABLE: [M31R_70_WIRED]})
+        self.assertEqual(1, len(found))
+        d = found[0]
+        self.assertEqual(("pulsar:14a5c010", "iRocks M31R (wired)", 70, True),
+                         (d.key, d.name, d.level, d.charging))
+
+    def test_both_ids_are_claimed_with_their_own_names(self):
+        self.assertEqual({0xC009: "iRocks M31R (2.4 GHz)", 0xC010: "iRocks M31R (wired)"},
+                         P.PIDS[0x14A5])
+
+    def test_the_receiver_and_the_cable_together_are_two_devices(self):
+        found, bus, _ = self.poll({M31R_RECEIVER: [M31R_70_WIRED],
+                                   M31R_CABLE: [M31R_70_WIRED]})
+        self.assertEqual(2, len(found))
+        self.assertEqual({"pulsar:14a5c009", "pulsar:14a5c010"}, {d.key for d in found})
+        self.assertEqual({"iRocks M31R (2.4 GHz)", "iRocks M31R (wired)"}, {d.name for d in found})
+        self.assertEqual({70}, {d.level for d in found})
+        self.assertEqual({M31R_RECEIVER, M31R_CABLE}, {pid for pid, _ in bus.sent})
+
+    def test_the_request_is_a_feature_report_on_the_command_collection(self):
+        found, bus, _ = self.poll({M31R_RECEIVER: [M31R_55]})
+        self.assertEqual([(M31R_RECEIVER, list(M31R_REQUEST))], bus.sent)
+        self.assertEqual(17, len(M31R_REQUEST))
+        self.assertEqual(0x49, 0x55 - 0x08 - 0x04)
+        self.assertEqual(list(M31R_REQUEST), P.make_request())
+        self.assertEqual([], bus.written, "there is no output report to write to")
+
+    def test_only_the_command_and_the_reply_collections_are_opened(self):
+        _, bus, _ = self.poll({M31R_RECEIVER: [M31R_55]})
+        self.assertEqual({(M31R_RECEIVER, 0xFF02, 0x0002), (M31R_RECEIVER, 0xFF01, 0x0000)},
+                         set(bus.opened))
+
+    def test_a_reply_with_a_bad_checksum_is_refused(self):
+        bad = bytearray(M31R_55)
+        bad[16] ^= 0xFF
+        found, _, _ = self.poll({M31R_RECEIVER: [bytes(bad)]})
+        self.assertEqual([], found)
+
+    def test_a_bad_checksum_is_skipped_and_the_good_reply_after_it_is_used(self):
+        bad = bytearray(M31R_55)
+        bad[16] ^= 0x01
+        found, _, _ = self.poll({M31R_RECEIVER: [bytes(bad), M31R_75_CHARGING]})
+        self.assertEqual((75, True), (found[0].level, found[0].charging))
+
+    def test_header_0x08_and_0x09_are_both_accepted(self):
+        for header in (0x08, 0x09):
+            with self.subTest(header=header):
+                found, _, _ = self.poll({M31R_RECEIVER: [reply(42, 1, header=header)]})
+                self.assertEqual(1, len(found))
+                self.assertEqual((42, True), (found[0].level, found[0].charging))
+
+    def test_another_header_is_refused(self):
+        found, _, _ = self.poll({M31R_RECEIVER: [reply(42, header=0x0A)]})
+        self.assertEqual([], found)
+
+    def test_the_pairing_reply_and_events_are_ignored_and_reading_goes_on(self):
+        frames = [M31R_PAIR_REPLY,
+                  reply(11, command=0x0A, header=0x09),
+                  reply(12, command=0x03, header=0x09),
+                  M31R_55]
+        found, _, _ = self.poll({M31R_RECEIVER: frames})
+        self.assertEqual(1, len(found))
+        self.assertEqual((55, False), (found[0].level, found[0].charging))
+
+    def test_only_those_other_replies_give_no_device(self):
+        found, _, _ = self.poll({M31R_RECEIVER: [M31R_PAIR_REPLY, reply(30, command=0x0A,
+                                                                         header=0x09)]})
+        self.assertEqual([], found)
+
+    def test_an_all_zero_reply_is_not_a_reading(self):
+        found, _, _ = self.poll({M31R_RECEIVER: [bytes(17)]})
+        self.assertEqual([], found)
+
+    def test_a_level_above_100_is_refused(self):
+        found, _, _ = self.poll({M31R_RECEIVER: [reply(101, header=0x09)]})
+        self.assertEqual([], found)
+
+    def test_no_pairing_probe_is_sent(self):
+        _, bus, _ = self.poll({M31R_RECEIVER: [M31R_55]})
+        self.assertEqual([0x04], [frame[1] for _, frame in bus.sent])
+
+    def test_there_is_no_millivolt_reading_for_this_model(self):
+        found, _, provider = self.poll({M31R_RECEIVER: [reply(55, 0, mv=3900, header=0x09)]})
+        self.assertEqual(55, found[0].level)
+        self.assertNotIn("mV", "\n".join(provider.diagnostics()))
+
+    def test_a_refused_feature_report_gives_no_device(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.refuse_feature = True
+        self.assertEqual([], P.PulsarProvider().poll())
+
+    def test_a_missing_reply_collection_gives_no_device_and_sends_nothing(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        gone = [p for p, (pid, page, usage) in bus.cols.items() if (page, usage) == (0xFF01, 0)]
+        for path in gone:
+            del bus.cols[path]
+        self.assertEqual([], P.PulsarProvider().poll())
+        self.assertEqual([], bus.sent)
+
+    def test_a_silent_mouse_keeps_its_reading_greyed(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        provider = P.PulsarProvider()
+        self.assertTrue(provider.poll()[0].online)
+        bus.scripts[M31R_RECEIVER] = []             # asleep: no answer now
+        kept = provider.poll()
+        self.assertEqual(1, len(kept))
+        self.assertFalse(kept[0].online)
+        self.assertEqual((55, False), (kept[0].level, kept[0].charging))
+
+    def test_other_pulsar_devices_still_need_the_0x08_header(self):
+        self.assertIsNone(P.parse_power(reply(50, header=0x09)))
+        self.assertIsNone(P.parse_power(reply(50, header=0x09), 0x3554))
+        self.assertEqual((50, False), P.parse_power(reply(50)))
+        self.assertEqual((50, False), P.parse_power(reply(50), 0x3554))
+
+    def test_other_pulsar_devices_still_get_an_output_report_and_ignore_header_0x09(self):
+        bus = FakeBus(0x3554, 0xF58A, [reply(50, header=0x09)], shape=SHAPE)
+        P.hidlist = types.SimpleNamespace(enumerate=bus.enumerate)
+        P.hid = types.SimpleNamespace(device=bus.device_class())
+        outputs = P.output_length
+        P.output_length = lambda path: None
+        try:
+            self.assertEqual([], P.PulsarProvider().poll())
+        finally:
+            P.output_length = outputs
+        self.assertEqual([(0xFF02, 0x0002)], bus.written())
 
 
 if __name__ == "__main__":

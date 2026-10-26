@@ -6,6 +6,16 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **iRocks M31R** on its 2.4 GHz receiver (14a5:c009) and on the USB cable (14a5:c010), both
+  read on real hardware under Windows and checked against the vendor software: the level and
+  the charging flag, with the same 17-byte command 0x04 frame as the Pulsar / ATK / VXE mice.
+  The request is a feature report on the `ff02:0002` collection and the reply is read from
+  `ff01:0000`; a reply with header 0x08 or 0x09 is accepted, but only when its checksum
+  matches. This model has no millivolt field. With the receiver and the cable plugged in at
+  the same time the mouse is listed twice, one entry for each. Other Pulsar devices are
+  unchanged.
+
 ### Changed
 - **A tidier repository and a shorter README**: the app's modules moved into the `halo/`
   package (`halo_battery.pyw` stays the entry point), the .bat helpers into `scripts/`
