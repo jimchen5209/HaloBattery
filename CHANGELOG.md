@@ -15,6 +15,13 @@ and the project follows [Semantic Versioning](https://semver.org/).
   matches. This model has no millivolt field. With the receiver and the cable plugged in at
   the same time the mouse is listed twice, one entry for each. Other Pulsar devices are
   unchanged.
+- **iRocks M31R on its 2.4 GHz receiver: no stale battery while the mouse is off or asleep.**
+  The receiver answers a battery query with the last level it remembers even when the mouse
+  is off, so the receiver is first asked the online command (0x03) and the battery is read
+  only when its answer says the mouse is online (byte 6 is 1, checksum and byte 2 valid).
+  Any other answer, no answer or a failed send or read counts as offline or asleep: the
+  tray shows "no link (off or asleep)" with no level, and the previous reading is not kept.
+  The USB cable (c010) is not asked and is read as before.
 
 ### Changed
 - **A tidier repository and a shorter README**: the app's modules moved into the `halo/`

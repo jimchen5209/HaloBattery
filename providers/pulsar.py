@@ -57,11 +57,17 @@ different transport. Its command collection (ff02:0002, feature report length 17
 output report, so the request goes out as a FEATURE report there, and the reply comes back
 as an input report on another collection, ff01:0000 (input length 17). The reply header is
 0x08 or 0x09 (the mice seen so far answer 0x09, and the checksum counts it), the checksum
-must match, and a reply with another command is skipped: 0x03 is the vendor software's
-pairing probe, which is not sent here, and 0x0a is an event. The level (byte 6) and the
-charging flag (byte 7) were checked against the vendor software. Bytes 8-9 are always 0 on
+must match, and a reply with another command is skipped (0x0a is an event). The level
+(byte 6) and the charging flag (byte 7) were checked against the vendor software. Bytes 8-9 are always 0 on
 this model - it has no millivolt field, so none is read - and byte 5 (usually 0x02) is
 unknown and unused. Every other vendor id keeps the single 0x08 header and the output report.
+
+The M31R receiver answers a power query even while its mouse is off or asleep (from the
+level it remembers), so the 2.4 GHz receiver is asked the online command first: request
+`08 03 00 ... 4a`, answer `09 03 00 00 00 01 <byte 6> ...`, accepted only with command 0x03,
+a valid checksum and byte 2 == 0, and byte 6 == 1 means online. The battery is read only
+then; anything else (byte 6 not 1, a bad answer, no answer, a failed send or read) is an
+offline or sleeping mouse, shown with no level and no kept reading. The cable is not asked.
 
 Frames are 17 bytes, big-endian, report id 0x08:
 
@@ -87,6 +93,7 @@ import hid
 from . import hidlist
 from .base import DeviceStatus, Provider, hexdump, log
 
+CMD_CONNECT = 0x03      # online status (M31R receiver)
 CMD_POWER = 0x04
 PAYLOAD_HEADER = 0x08
 PAYLOAD_LEN = 17
@@ -103,6 +110,12 @@ IROCKS_COMMAND_USAGE = (0xFF02, 0x0002)    # feature length 17, no output report
 IROCKS_REPLY_USAGE = (0xFF01, 0x0000)      # input length 17
 REPLY_HEADERS: Dict[int, Tuple[int, ...]] = {IROCKS_VID: (PAYLOAD_HEADER, 0x09)}
 IROCKS_READ_ATTEMPTS = 8        # events and other commands are skipped, so allow a few more
+# Only the 2.4 GHz receiver is asked whether its mouse is there: a power reply from it can be
+# a stale one (the receiver answers for a mouse that is off or asleep), so the battery is
+# read only after command 0x03 says byte 6 == 1. The cable (c010) is not asked.
+IROCKS_RECEIVER_PID = 0xC009
+ONLINE_INDEX = 6
+ONLINE_TIMEOUT_MS = 500
 
 CONTROL_INTERFACE = 1           # the tool reads its 17-byte replies on interface 1
 CONTROL_USAGE = (0xFF02, 0x0002)   # the collection the OpenMouse ATK/VXE panel opens
@@ -202,8 +215,8 @@ def checksum(payload: List[int]) -> int:
     return (CHECKSUM_BASE - sum(payload)) % 256
 
 
-def make_request() -> List[int]:
-    frame = [PAYLOAD_HEADER, CMD_POWER] + [0x00] * (PAYLOAD_LEN - 3)
+def make_request(command: int = CMD_POWER) -> List[int]:
+    frame = [PAYLOAD_HEADER, command] + [0x00] * (PAYLOAD_LEN - 3)
     frame.append(checksum(frame))
     return frame
 
@@ -222,6 +235,22 @@ def parse_power(r, vid: Optional[int] = None) -> Optional[Tuple[int, bool]]:
     if not 0 <= level <= 100:
         return None
     return level, frame[POWER_INDEX] != 0
+
+
+def parse_online(r, vid: Optional[int] = None) -> Optional[bool]:
+    """Whether the mouse is online, from an M31R receiver's answer to command 0x03, or None
+    when this is not one: the header and the checksum must be right, the command 0x03 and
+    the status byte (2) zero. Only byte 6 == 1 means online; any other value is offline."""
+    if not r or len(r) < PAYLOAD_LEN:
+        return None
+    frame = list(r[:PAYLOAD_LEN])
+    if frame[0] not in REPLY_HEADERS.get(vid, (PAYLOAD_HEADER,)) or frame[1] != CMD_CONNECT:
+        return None
+    if frame[PAYLOAD_LEN - 1] != checksum(frame[:PAYLOAD_LEN - 1]):
+        return None
+    if frame[2] != 0:
+        return None
+    return frame[ONLINE_INDEX] == 1
 
 
 def voltage_mv(r) -> Optional[int]:
@@ -275,18 +304,21 @@ class PulsarProvider(Provider):
                           f"falling back to the first of {len(infos)}")
         return infos[0] if infos else None
 
-    def _read_reply(self, dev, vid: Optional[int] = None,
-                    attempts: int = READ_ATTEMPTS) -> Optional[List[int]]:
-        """The first power reply from dev; events and other frames are skipped."""
+    def _read_reply(self, dev, vid: Optional[int] = None, attempts: int = READ_ATTEMPTS,
+                    command: int = CMD_POWER) -> Optional[List[int]]:
+        """The first reply to `command` (power by default) from dev; events and frames of
+        another command are skipped."""
+        parse, what, timeout = ((parse_power, "power", READ_TIMEOUT_MS) if command == CMD_POWER
+                                else (parse_online, "online", ONLINE_TIMEOUT_MS))
         for attempt in range(attempts):
-            r = dev.read(PAYLOAD_LEN, READ_TIMEOUT_MS)
+            r = dev.read(PAYLOAD_LEN, timeout)
             if not r:
                 break
             self._diag.append(f"  reply {attempt + 1}: {hexdump(r)}")
-            if parse_power(r, vid) is not None:
+            if parse(r, vid) is not None:
                 return list(r)
             time.sleep(0.02)
-        self._diag.append("  no power reply (events and short frames are ignored)")
+        self._diag.append(f"  no {what} reply (events and short frames are ignored)")
         return None
 
     def _query(self, path: bytes) -> Optional[List[int]]:
@@ -309,9 +341,17 @@ class PulsarProvider(Provider):
             except Exception:
                 pass
 
-    def _query_feature(self, infos: List[dict]) -> Optional[List[int]]:
+    def _query_feature(self, infos: List[dict], check_online: bool = False
+                       ) -> Tuple[Optional[bool], Optional[List[int]]]:
         """iRocks M31R: the request as a feature report on ff02:0002, the reply read
-        from the input reports of ff01:0000."""
+        from the input reports of ff01:0000. Returns (online, power reply).
+
+        With check_online (the 2.4 GHz receiver) the online command goes first and the
+        battery is only asked for when it answers "online": online is then False for
+        everything but a valid "byte 6 == 1" answer (bad checksum, byte 2 set, no answer,
+        a failed send or read), and no power query is made. online is None when the
+        collections could not even be opened, which says nothing about the mouse. Without
+        check_online (the cable) online is True or None, as before."""
         command = next((d for d in infos
                         if (d.get("usage_page"), d.get("usage")) == IROCKS_COMMAND_USAGE), None)
         replies = next((d for d in infos
@@ -319,8 +359,9 @@ class PulsarProvider(Provider):
         if command is None or replies is None:
             self._diag.append("  needs the ff02:0002 and ff01:0000 collections; "
                               f"{'ff02:0002' if command is None else 'ff01:0000'} not found")
-            return None
+            return None, None
         opened = []
+        state: Optional[bool] = None    # what a failure from here on means for the mouse
         try:
             for d in (replies, command):
                 dev = hid.device()
@@ -328,18 +369,34 @@ class PulsarProvider(Provider):
                     dev.open_path(d["path"])
                 except (OSError, IOError) as e:
                     self._diag.append(f"  open: {e}")
-                    return None
+                    return None, None
                 opened.append(dev)
             reader, writer = opened
+            if check_online:
+                state = False       # opened: from here on a failure means offline
             self._drain(reader)
+            if check_online:
+                n = writer.send_feature_report(make_request(CMD_CONNECT))
+                if n is not None and n < 0:
+                    self._diag.append("  online query: send refused")
+                    return False, None
+                answer = self._read_reply(reader, IROCKS_VID, IROCKS_READ_ATTEMPTS, CMD_CONNECT)
+                online = parse_online(answer, IROCKS_VID)
+                self._diag.append(f"  online: {online if answer else 'no answer'}"
+                                  f"{'' if online else ' - treated as offline or asleep'}")
+                if not online:
+                    return False, None
+                state = True        # online: a battery failure is not an offline mouse
+                # a power frame the receiver sent along with the answer is not ours
+                self._drain(reader)
             n = writer.send_feature_report(make_request())
             if n is not None and n < 0:
                 self._diag.append("  send: refused")
-                return None
-            return self._read_reply(reader, IROCKS_VID, IROCKS_READ_ATTEMPTS)
+                return state, None
+            return True, self._read_reply(reader, IROCKS_VID, IROCKS_READ_ATTEMPTS)
         except (OSError, IOError, ValueError) as e:
             self._diag.append(f"  query error: {e}")
-            return None
+            return state, None
         finally:
             for dev in opened:
                 try:
@@ -373,7 +430,18 @@ class PulsarProvider(Provider):
                 name = pids[pid]
                 if vid == IROCKS_VID:
                     self._diag.append(f"[Pulsar] pid={vid:04x}:{pid:04x} '{name}'")
-                    reply = self._query_feature(mine)
+                    online, reply = self._query_feature(mine, pid == IROCKS_RECEIVER_PID)
+                    if online is False:
+                        # The receiver says its mouse is off or asleep (or would not say):
+                        # no battery is shown, and the earlier reading is dropped rather
+                        # than kept greyed - after an online check it would be stale.
+                        # Same shape as a receiver whose headset does not answer
+                        # (barracuda): no level, not online, "no link (off or asleep)".
+                        self._last.pop(key, None)
+                        self._diag.append("    mouse offline or asleep; no battery reported")
+                        out.append(DeviceStatus(key, name, None, False, False, "pulsar",
+                                                kind="mouse", wake_on_input=True))
+                        continue
                 else:
                     d = self._pick(mine)
                     if d is None:

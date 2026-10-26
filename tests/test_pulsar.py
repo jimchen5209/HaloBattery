@@ -21,6 +21,8 @@ from the vendor application; the same rule picks its ff02:0002 collection.
 The iRocks M31R (14a5:c009 on the receiver, 14a5:c010 on the cable) is faked with the
 collections its Windows report lists and the frames that were read from it on real hardware:
 the request is a feature report on ff02:0002 and the reply is an input report on ff01:0000.
+The receiver is asked the online command (0x03) first and its battery only when it says
+the mouse is online; the frames of that exchange were read from the mouse the same way.
 
 hidlist.enumerate() and hid.device() are replaced: the real ones ask Windows for
 collections of real devices.
@@ -78,6 +80,14 @@ def reply(level, power=0, mv=0, command=P.CMD_POWER, header=P.PAYLOAD_HEADER,
     if break_checksum:
         ck ^= 0xFF
     return bytes(frame + [ck])
+
+
+def with_checksum(frame, changes):
+    """frame with some bytes changed ({index: value}) and its checksum made right again."""
+    out = list(frame[:P.PAYLOAD_LEN - 1])
+    for index, value in changes.items():
+        out[index] = value
+    return bytes(out + [P.checksum(out)])
 
 
 class FakeCollection:
@@ -433,6 +443,14 @@ M31R_75_CHARGING = bytes.fromhex("09 04 00 00 00 02 4b 01 00 00 00 00 00 00 00 0
 M31R_70_WIRED = bytes.fromhex("09 04 00 00 00 02 46 01 00 00 00 00 00 00 00 00 ff")
 M31R_PAIR_REPLY = bytes.fromhex("09 03 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00")
 M31R_REQUEST = bytes.fromhex("08 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 49")
+# the online command (0x03) and the receiver's answers to it, read from the mouse on real
+# hardware: byte 6 is 1 with the mouse awake and 0 with it off or asleep
+M31R_ONLINE_REQUEST = bytes.fromhex("08 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 4a")
+M31R_ONLINE = bytes.fromhex("09 03 00 00 00 01 01 00 00 00 00 00 00 00 00 00 47")
+M31R_OFFLINE = bytes.fromhex("09 03 00 00 00 01 00 00 00 00 00 00 00 00 00 00 48")
+# a power frame (60 %) the receiver sends 309 ms after the answer to the online command
+# while the mouse sleeps: the receiver's stale copy of an old reading
+M31R_STALE_60 = bytes.fromhex("09 04 00 00 00 02 3c 00 00 00 00 00 00 00 00 00 0a")
 
 # the collections of the receiver, plus the keyboard and the mouse that must never be opened
 M31R_SHAPE = [
@@ -450,11 +468,15 @@ M31R_RECEIVER, M31R_CABLE = 0xC009, 0xC010
 
 class FakeM31R:
     """One or two M31R on the bus. A valid power request (a feature report on ff02:0002)
-    is answered by queueing that device's script on its ff01:0000 collection; a frame with
-    a bad checksum is ignored, and the command collection has no output report."""
+    is answered by queueing that device's script on its ff01:0000 collection, a valid online
+    request (0x03) by queueing its `online` script (the mouse is online by default); a frame
+    with a bad checksum is ignored, and the command collection has no output report."""
 
     def __init__(self, scripts):
         self.scripts = {pid: list(frames) for pid, frames in scripts.items()}
+        self.online = {pid: [M31R_ONLINE] for pid in scripts}
+        self.refuse = set()       # commands whose feature report is refused (send returns -1)
+        self.reads_fail = False   # reading the reply collection raises
         self.queues = {pid: [] for pid in scripts}
         self.cols = {}            # path -> (pid, usage page, usage)
         self.sent = []            # (pid, frame) for every feature report
@@ -489,10 +511,13 @@ class FakeM31R:
                     raise OSError("no feature report here")
                 frame = list(frame)
                 bus.sent.append((self.pid, frame))
-                if bus.refuse_feature:
+                if bus.refuse_feature or (len(frame) > 1 and frame[1] in bus.refuse):
                     return -1
-                if len(frame) == 17 and frame[1] == 0x04 and sum(frame) & 0xFF == 0x55:
-                    bus.queues[self.pid].extend(bus.scripts[self.pid])
+                if len(frame) == 17 and sum(frame) & 0xFF == 0x55:
+                    if frame[1] == 0x04:
+                        bus.queues[self.pid].extend(bus.scripts[self.pid])
+                    elif frame[1] == 0x03:
+                        bus.queues[self.pid].extend(bus.online[self.pid])
                 return len(frame)
 
             def get_feature_report(self, report_id, length):
@@ -507,6 +532,8 @@ class FakeM31R:
                     raise OSError("read error")
                 if (self.page, self.usage) != (0xFF01, 0x0000):
                     return b""
+                if bus.reads_fail and bus.sent:      # a read fails once a query went out
+                    raise OSError("read error")
                 queue = bus.queues[self.pid]
                 return queue.pop(0) if queue else b""
 
@@ -572,10 +599,13 @@ class M31RTest(unittest.TestCase):
 
     def test_the_request_is_a_feature_report_on_the_command_collection(self):
         found, bus, _ = self.poll({M31R_RECEIVER: [M31R_55]})
-        self.assertEqual([(M31R_RECEIVER, list(M31R_REQUEST))], bus.sent)
+        self.assertEqual([(M31R_RECEIVER, list(M31R_ONLINE_REQUEST)),
+                          (M31R_RECEIVER, list(M31R_REQUEST))], bus.sent)
         self.assertEqual(17, len(M31R_REQUEST))
         self.assertEqual(0x49, 0x55 - 0x08 - 0x04)
+        self.assertEqual(0x4A, 0x55 - 0x08 - 0x03)
         self.assertEqual(list(M31R_REQUEST), P.make_request())
+        self.assertEqual(list(M31R_ONLINE_REQUEST), P.make_request(P.CMD_CONNECT))
         self.assertEqual([], bus.written, "there is no output report to write to")
 
     def test_only_the_command_and_the_reply_collections_are_opened(self):
@@ -628,37 +658,187 @@ class M31RTest(unittest.TestCase):
         found, _, _ = self.poll({M31R_RECEIVER: [reply(101, header=0x09)]})
         self.assertEqual([], found)
 
-    def test_no_pairing_probe_is_sent(self):
+    def test_the_receiver_is_asked_online_first_then_for_the_battery(self):
         _, bus, _ = self.poll({M31R_RECEIVER: [M31R_55]})
-        self.assertEqual([0x04], [frame[1] for _, frame in bus.sent])
+        self.assertEqual([0x03, 0x04], [frame[1] for _, frame in bus.sent])
+
+    def test_the_cable_is_not_asked_whether_it_is_online(self):
+        found, bus, _ = self.poll({M31R_CABLE: [M31R_70_WIRED]})
+        self.assertEqual([(M31R_CABLE, 0x04)], [(pid, frame[1]) for pid, frame in bus.sent])
+        self.assertEqual(70, found[0].level)
 
     def test_there_is_no_millivolt_reading_for_this_model(self):
         found, _, provider = self.poll({M31R_RECEIVER: [reply(55, 0, mv=3900, header=0x09)]})
         self.assertEqual(55, found[0].level)
         self.assertNotIn("mV", "\n".join(provider.diagnostics()))
 
-    def test_a_refused_feature_report_gives_no_device(self):
-        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+    def test_a_refused_feature_report_gives_no_device_for_the_cable(self):
+        bus = self.bus({M31R_CABLE: [M31R_70_WIRED]})
         bus.refuse_feature = True
         self.assertEqual([], P.PulsarProvider().poll())
 
     def test_a_missing_reply_collection_gives_no_device_and_sends_nothing(self):
-        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus = self.bus({M31R_RECEIVER: [M31R_55], M31R_CABLE: [M31R_70_WIRED]})
         gone = [p for p, (pid, page, usage) in bus.cols.items() if (page, usage) == (0xFF01, 0)]
         for path in gone:
             del bus.cols[path]
         self.assertEqual([], P.PulsarProvider().poll())
         self.assertEqual([], bus.sent)
 
-    def test_a_silent_mouse_keeps_its_reading_greyed(self):
-        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+    def test_a_silent_cable_keeps_its_reading_greyed(self):
+        bus = self.bus({M31R_CABLE: [M31R_70_WIRED]})
         provider = P.PulsarProvider()
         self.assertTrue(provider.poll()[0].online)
-        bus.scripts[M31R_RECEIVER] = []             # asleep: no answer now
+        bus.scripts[M31R_CABLE] = []                # no answer now
         kept = provider.poll()
         self.assertEqual(1, len(kept))
         self.assertFalse(kept[0].online)
-        self.assertEqual((55, False), (kept[0].level, kept[0].charging))
+        self.assertEqual((70, True), (kept[0].level, kept[0].charging))
+
+    def test_an_online_receiver_that_does_not_answer_the_battery_query_keeps_the_greyed_reading(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        provider = P.PulsarProvider()
+        self.assertTrue(provider.poll()[0].online)
+        bus.scripts[M31R_RECEIVER] = []             # still online, but no power reply now
+        kept = provider.poll()
+        self.assertEqual([0x03, 0x04, 0x03, 0x04], [f[1] for _, f in bus.sent])
+        self.assertEqual(1, len(kept))
+        self.assertFalse(kept[0].online)
+        self.assertEqual(55, kept[0].level)
+
+    # ---- the online check (command 0x03), 2.4 GHz receiver only
+
+    def test_the_real_online_frames_parse(self):
+        self.assertIs(True, P.parse_online(M31R_ONLINE, P.IROCKS_VID))
+        self.assertIs(False, P.parse_online(M31R_OFFLINE, P.IROCKS_VID))
+        self.assertIsNone(P.parse_online(M31R_55, P.IROCKS_VID))      # a power frame
+        self.assertIsNone(P.parse_online(bytes(17), P.IROCKS_VID))
+        self.assertIsNone(P.parse_online(M31R_ONLINE[:16], P.IROCKS_VID))
+        self.assertIsNone(P.parse_online(None, P.IROCKS_VID))
+
+    def assertOffline(self, found, key="pulsar:14a5c009"):
+        """One entry for the mouse: no level, not online, not charging - the tray shows
+        "no link (off or asleep)" - and never a battery reading."""
+        self.assertEqual(1, len(found), found)
+        d = found[0]
+        self.assertEqual(key, d.key)
+        self.assertIsNone(d.level)
+        self.assertFalse(d.online)
+        self.assertFalse(d.charging)
+        self.assertEqual("mouse", d.kind)
+        self.assertTrue(d.wake_on_input)
+
+    def test_an_offline_mouse_is_not_asked_for_its_battery_and_shows_no_level(self):
+        for answer in ([M31R_OFFLINE], [M31R_OFFLINE, M31R_STALE_60], [M31R_STALE_60, M31R_OFFLINE]):
+            with self.subTest(answer=[bytes(a).hex() for a in answer]):
+                bus = self.bus({M31R_RECEIVER: [M31R_55]})
+                bus.online[M31R_RECEIVER] = answer
+                self.assertOffline(P.PulsarProvider().poll())
+                self.assertEqual([0x03], [f[1] for _, f in bus.sent], "no battery query")
+
+    def test_a_mouse_that_went_off_does_not_keep_its_last_battery(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        provider = P.PulsarProvider()
+        self.assertEqual(55, provider.poll()[0].level)
+        bus.online[M31R_RECEIVER] = [M31R_OFFLINE, M31R_STALE_60]
+        self.assertOffline(provider.poll())
+        self.assertOffline(provider.poll())          # and it stays that way
+        bus.online[M31R_RECEIVER] = [M31R_ONLINE]    # back: read again
+        back = provider.poll()
+        self.assertEqual((55, True), (back[0].level, back[0].online))
+
+    def test_a_stale_power_frame_sent_with_the_online_answer_is_not_a_reading(self):
+        # online, the power frame (60 %) comes along after the answer and the real battery
+        # query gets no answer: the stray 60 must not be shown
+        bus = self.bus({M31R_RECEIVER: []})
+        bus.online[M31R_RECEIVER] = [M31R_ONLINE, M31R_STALE_60]
+        self.assertEqual([], P.PulsarProvider().poll())
+        # and a power frame ahead of the online answer is skipped while reading it
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.online[M31R_RECEIVER] = [M31R_STALE_60, M31R_ONLINE]
+        found = P.PulsarProvider().poll()
+        self.assertEqual((55, True), (found[0].level, found[0].online))
+
+    def test_only_byte_6_equal_to_1_is_online(self):
+        for value, online in ((1, True), (0, False), (2, False), (0xFF, False)):
+            with self.subTest(byte6=value):
+                bus = self.bus({M31R_RECEIVER: [M31R_55]})
+                bus.online[M31R_RECEIVER] = [with_checksum(M31R_ONLINE, {6: value})]
+                found = P.PulsarProvider().poll()
+                if online:
+                    self.assertEqual((55, True), (found[0].level, found[0].online))
+                else:
+                    self.assertOffline(found)
+
+    def test_an_online_answer_with_a_bad_checksum_is_offline(self):
+        bad = bytearray(M31R_ONLINE)
+        bad[16] ^= 0x01
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.online[M31R_RECEIVER] = [bytes(bad)]
+        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([0x03], [f[1] for _, f in bus.sent])
+
+    def test_an_online_answer_with_byte_2_set_is_offline(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.online[M31R_RECEIVER] = [with_checksum(M31R_ONLINE, {2: 1})]
+        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([0x03], [f[1] for _, f in bus.sent])
+
+    def test_a_power_frame_does_not_answer_the_online_query(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.online[M31R_RECEIVER] = [M31R_55, M31R_75_CHARGING]
+        self.assertOffline(P.PulsarProvider().poll())
+
+    def test_no_online_answer_is_offline(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.online[M31R_RECEIVER] = []
+        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([0x03], [f[1] for _, f in bus.sent])
+
+    def test_events_and_zero_frames_before_the_online_answer_are_skipped(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.online[M31R_RECEIVER] = [reply(30, command=0x0A, header=0x09), bytes(17), M31R_ONLINE]
+        self.assertEqual(55, P.PulsarProvider().poll()[0].level)
+
+    def test_a_refused_online_query_is_offline(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.refuse = {0x03}
+        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([0x03], [f[1] for _, f in bus.sent])
+
+    def test_a_failing_read_of_the_online_answer_is_offline(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.reads_fail = True
+        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([0x03], [f[1] for _, f in bus.sent])
+
+    def test_a_refused_battery_query_of_an_online_mouse_is_not_offline(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.refuse = {0x04}
+        self.assertEqual([], P.PulsarProvider().poll())
+
+    def test_the_wired_mouse_is_unaffected_by_the_receivers_state(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55], M31R_CABLE: [M31R_70_WIRED]})
+        bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
+        found = {d.key: d for d in P.PulsarProvider().poll()}
+        self.assertIsNone(found["pulsar:14a5c009"].level)
+        self.assertEqual((70, True, True), (found["pulsar:14a5c010"].level,
+                                            found["pulsar:14a5c010"].charging,
+                                            found["pulsar:14a5c010"].online))
+
+    def test_the_reply_collection_is_opened_before_the_command_and_nothing_is_written(self):
+        _, bus, _ = self.poll({M31R_RECEIVER: [M31R_55]})
+        self.assertEqual([(M31R_RECEIVER, 0xFF01, 0x0000), (M31R_RECEIVER, 0xFF02, 0x0002)],
+                         bus.opened)
+        self.assertEqual([], bus.written)
+
+    def test_an_offline_diagnostic_says_so(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
+        provider = P.PulsarProvider()
+        provider.poll()
+        diag = "\n".join(provider.diagnostics())
+        self.assertIn("offline or asleep", diag)
 
     def test_other_pulsar_devices_still_need_the_0x08_header(self):
         self.assertIsNone(P.parse_power(reply(50, header=0x09)))
