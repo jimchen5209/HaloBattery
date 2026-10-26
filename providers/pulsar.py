@@ -67,7 +67,17 @@ level it remembers), so the 2.4 GHz receiver is asked the online command first: 
 `08 03 00 ... 4a`, answer `09 03 00 00 00 01 <byte 6> ...`, accepted only with command 0x03,
 a valid checksum and byte 2 == 0, and byte 6 == 1 means online. The battery is read only
 then; anything else (byte 6 not 1, a bad answer, no answer, a failed send or read) is an
-offline or sleeping mouse, shown with no level and no kept reading. The cable is not asked.
+offline or sleeping mouse, and no level is read from it. It is shown like any other device
+that stopped answering: the last reading taken while it was online, greyed out ("NN% (last
+known value, device asleep)"), until it answers again. Exception, one query: when it is
+found offline with no earlier reading (the app started while the mouse was off), the power
+query is sent once, after emptying the queue, because a receiver then answers with the level
+it remembers (60 % was seen on real hardware); a valid reply of 1..100 % is shown greyed as
+the last known value (never as charging), anything else (0, out of range, no reply) leaves
+"no link (off or asleep)". That query is not repeated until the mouse has been online
+again, and a power frame that merely arrives with the online answer is never used. The
+receiver's memory may not be the mouse's last level, and whether the query wakes a sleeping
+mouse is not known. The cable is not asked.
 
 Frames are 17 bytes, big-endian, report id 0x08:
 
@@ -266,6 +276,9 @@ class PulsarProvider(Provider):
         self._diag: List[str] = []
         # key -> (name, level, charging, when it was last read)
         self._last: Dict[str, Tuple[str, int, bool, float]] = {}
+        # receivers (M31R c009) asked for their remembered level during this offline stretch
+        self._asked: set = set()
+        self._asked_now = False     # set by _query_feature when it sent that one query
 
     def _pick(self, infos: List[dict]) -> Optional[dict]:
         """The collection to open.
@@ -341,7 +354,8 @@ class PulsarProvider(Provider):
             except Exception:
                 pass
 
-    def _query_feature(self, infos: List[dict], check_online: bool = False
+    def _query_feature(self, infos: List[dict], check_online: bool = False,
+                       ask_remembered: bool = False
                        ) -> Tuple[Optional[bool], Optional[List[int]]]:
         """iRocks M31R: the request as a feature report on ff02:0002, the reply read
         from the input reports of ff01:0000. Returns (online, power reply).
@@ -349,9 +363,14 @@ class PulsarProvider(Provider):
         With check_online (the 2.4 GHz receiver) the online command goes first and the
         battery is only asked for when it answers "online": online is then False for
         everything but a valid "byte 6 == 1" answer (bad checksum, byte 2 set, no answer,
-        a failed send or read), and no power query is made. online is None when the
+        a failed send or read), and no power query is made (but for ask_remembered). online is None when the
         collections could not even be opened, which says nothing about the mouse. Without
-        check_online (the cable) online is True or None, as before."""
+        check_online (the cable) online is True or None, as before.
+
+        ask_remembered: when the receiver answers "offline" and there is no earlier reading
+        to show, ask once for the level it remembers (see the module docstring); that power
+        reply, if any, comes back with online False. It is the only power query ever sent
+        to a receiver that said offline."""
         command = next((d for d in infos
                         if (d.get("usage_page"), d.get("usage")) == IROCKS_COMMAND_USAGE), None)
         replies = next((d for d in infos
@@ -385,6 +404,16 @@ class PulsarProvider(Provider):
                 self._diag.append(f"  online: {online if answer else 'no answer'}"
                                   f"{'' if online else ' - treated as offline or asleep'}")
                 if not online:
+                    if ask_remembered and answer:
+                        # a clear "offline" answer: the one power query, after emptying
+                        # the queue so that only a reply to it can be read
+                        self._drain(reader)
+                        self._asked_now = True
+                        n = writer.send_feature_report(make_request())
+                        if n is not None and n < 0:
+                            self._diag.append("  remembered level: send refused")
+                            return False, None
+                        return False, self._read_reply(reader, IROCKS_VID, IROCKS_READ_ATTEMPTS)
                     return False, None
                 state = True        # online: a battery failure is not an offline mouse
                 # a power frame the receiver sent along with the answer is not ours
@@ -430,17 +459,31 @@ class PulsarProvider(Provider):
                 name = pids[pid]
                 if vid == IROCKS_VID:
                     self._diag.append(f"[Pulsar] pid={vid:04x}:{pid:04x} '{name}'")
-                    online, reply = self._query_feature(mine, pid == IROCKS_RECEIVER_PID)
+                    receiver = pid == IROCKS_RECEIVER_PID
+                    self._asked_now = False
+                    online, reply = self._query_feature(
+                        mine, receiver, receiver and key not in self._last and key not in self._asked)
+                    if self._asked_now:
+                        self._asked.add(key)
                     if online is False:
-                        # The receiver says its mouse is off or asleep (or would not say):
-                        # no battery is shown, and the earlier reading is dropped rather
-                        # than kept greyed - after an online check it would be stale.
-                        # Same shape as a receiver whose headset does not answer
-                        # (barracuda): no level, not online, "no link (off or asleep)".
-                        self._last.pop(key, None)
-                        self._diag.append("    mouse offline or asleep; no battery reported")
-                        out.append(DeviceStatus(key, name, None, False, False, "pulsar",
-                                                kind="mouse", wake_on_input=True))
+                        # The receiver says its mouse is off or asleep (or would not say).
+                        # Its battery is not read: the last reading from while the mouse was
+                        # online stays, greyed out, by the loop below ("last known value,
+                        # device asleep", like the other devices). With none yet, the
+                        # level the receiver remembers (one query) is shown the same way,
+                        # when it is a real level; else "no link (off or asleep)".
+                        self._diag.append("    mouse offline or asleep")
+                        parsed = parse_power(reply, vid)
+                        if key not in self._last and parsed is not None and 1 <= parsed[0] <= 100:
+                            self._diag.append(f"    remembered by the receiver: {parsed[0]}% "
+                                              "(shown as the last known value)")
+                            # its charging flag is no longer true, so it is not kept
+                            self._last[key] = (name, parsed[0], False, now)
+                        elif reply:
+                            self._diag.append("    the remembered level is not usable")
+                        if key not in self._last:
+                            out.append(DeviceStatus(key, name, None, False, False, "pulsar",
+                                                    kind="mouse", wake_on_input=True))
                         continue
                 else:
                     d = self._pick(mine)
@@ -464,6 +507,7 @@ class PulsarProvider(Provider):
                 found.add(key)
                 out.append(DeviceStatus(key, name, level, on_cable, True, "pulsar",
                                         kind="mouse"))
+        self._asked &= present
         # A mouse that stopped answering is not necessarily a mouse that went away
         # (idle it stops answering - see the docstring), so its last reading stays
         # greyed out for as long as its receiver is still in the USB tree, however
