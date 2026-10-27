@@ -22,10 +22,21 @@ and the project follows [Semantic Versioning](https://semver.org/).
   Any other answer, no answer or a failed send or read counts as offline or asleep: the
   tray shows the last reading taken while the mouse was online, greyed out ("55% (last known
   value, device asleep)", like the other devices), with no alert, sound or history entry, and
-  the live value returns when the mouse does. When the app starts with the mouse already
-  off, the power query is sent once and the level the receiver remembers is shown the same
-  way (only a value of 1..100 %, never as charging); otherwise it shows "no link (off or
-  asleep)". The USB cable (c010) is not asked and is read as before.
+  the live value returns when the mouse does. That last reading is kept for 300 seconds
+  (the same limit as the WLmouse, Lamzu and G-Wolves receivers), counted from the last time
+  the mouse answered online - polls while it is offline do not renew it; after that the
+  receiver is no longer reported, as when the app starts with the mouse already off (with
+  "Keep disconnected devices until restart" on, an icon that was already shown stays grey).
+  When the app starts with the mouse already off there is no reading to show, so nothing
+  appears in the tray (as for the other devices) until the mouse is first seen online; the
+  level the receiver remembers is never read. The USB cable (c010) has no offline
+  state, because a mouse on its cable never goes offline: it is not asked whether it is
+  online, a good reading is shown as live, and when the cable gives no good reading (no
+  answer, a bad reply, or it is unplugged) nothing is reported for it - never a greyed
+  reading and no 300 seconds. Whether its icon is then removed (two polls without a
+  reading) or kept greyed by the app is the "Keep disconnected devices until restart"
+  setting's decision. The 300 seconds are for the receiver only, and the other Pulsar
+  devices are unchanged.
 
 ### Changed
 - **A tidier repository and a shorter README**: the app's modules moved into the `halo/`

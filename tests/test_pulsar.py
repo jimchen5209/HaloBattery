@@ -23,8 +23,8 @@ collections its Windows report lists and the frames that were read from it on re
 the request is a feature report on ff02:0002 and the reply is an input report on ff01:0000.
 The receiver is asked the online command (0x03) first and its battery only when it says
 the mouse is online. With the mouse off or asleep (the receiver remembers 60 %) the last
-reading from while it was online is shown greyed; with none, the one power query that is
-sent while offline gives the remembered level (1..100 only), else "no link".
+reading from while it was online is shown greyed; with none (the app started with the mouse
+off) nothing is reported, and no power query is sent while offline.
 
 hidlist.enumerate() and hid.device() are replaced: the real ones ask Windows for
 collections of real devices.
@@ -416,6 +416,18 @@ class PulsarTest(unittest.TestCase):
         self.assertFalse(kept[0].online)
         self.assertEqual(64, kept[0].level)
 
+    def test_other_pulsar_devices_are_not_limited_to_300_s(self):
+        # the 300 s limit is the M31R receiver's only (c009, ASLEEP_KEEP)
+        self.one_receiver(replies=[reply(64)])
+        provider = P.PulsarProvider()
+        with mock.patch.object(P.time, "time", return_value=1000.0):
+            provider.poll()
+        for t in (1299.0, 1300.0, 1301.0, 1000.0 + 86400.0):
+            with mock.patch.object(P.time, "time", return_value=t):
+                kept = provider.poll()
+            self.assertEqual([("pulsar:3554f58a", 64, False)],
+                             [(k.key, k.level, k.online) for k in kept], t)
+
     def test_an_unplugged_receiver_is_not_kept(self):
         self.one_receiver(replies=[reply(64)])
         provider = P.PulsarProvider()
@@ -691,15 +703,12 @@ class M31RTest(unittest.TestCase):
         self.assertEqual([], P.PulsarProvider().poll())
         self.assertEqual([], bus.sent)
 
-    def test_a_silent_cable_keeps_its_reading_greyed(self):
+    def test_a_silent_cable_is_not_kept_greyed_it_reports_nothing(self):
         bus = self.bus({M31R_CABLE: [M31R_70_WIRED]})
         provider = P.PulsarProvider()
         self.assertTrue(provider.poll()[0].online)
         bus.scripts[M31R_CABLE] = []                # no answer now
-        kept = provider.poll()
-        self.assertEqual(1, len(kept))
-        self.assertFalse(kept[0].online)
-        self.assertEqual((70, True), (kept[0].level, kept[0].charging))
+        self.assertEqual([], provider.poll())
 
     def test_an_online_receiver_that_does_not_answer_the_battery_query_keeps_the_greyed_reading(self):
         bus = self.bus({M31R_RECEIVER: [M31R_55]})
@@ -721,18 +730,6 @@ class M31RTest(unittest.TestCase):
         self.assertIsNone(P.parse_online(bytes(17), P.IROCKS_VID))
         self.assertIsNone(P.parse_online(M31R_ONLINE[:16], P.IROCKS_VID))
         self.assertIsNone(P.parse_online(None, P.IROCKS_VID))
-
-    def assertOffline(self, found, key="pulsar:14a5c009"):
-        """One entry for the mouse: no level, not online, not charging - the tray shows
-        "no link (off or asleep)" - and never a battery reading."""
-        self.assertEqual(1, len(found), found)
-        d = found[0]
-        self.assertEqual(key, d.key)
-        self.assertIsNone(d.level)
-        self.assertFalse(d.online)
-        self.assertFalse(d.charging)
-        self.assertEqual("mouse", d.kind)
-        self.assertTrue(d.wake_on_input)
 
     def assertGreyed(self, found, level, charging=False, key="pulsar:14a5c009"):
         """One entry: a last known level, not online - "NN% (last known value, device
@@ -769,125 +766,315 @@ class M31RTest(unittest.TestCase):
         bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
         self.assertGreyed(provider.poll(), 75, charging=True)
 
-    def test_an_offline_start_shows_the_level_the_receiver_remembers_greyed(self):
-        for what, frame in (("off", M31R_OFF_60), ("asleep", M31R_SLEEP_60)):
+    def test_an_offline_start_shows_nothing_and_never_sends_a_power_query(self):
+        # the app started with the mouse off or asleep: nothing to show yet, as for the other
+        # devices. The receiver would answer a power query with the 60 % it remembers (and may
+        # send that frame unasked), but it is neither asked nor read.
+        for what, answer in (("off", [M31R_OFFLINE]),
+                             ("asleep", [M31R_OFFLINE, M31R_SLEEP_60]),
+                             ("asleep, frame first", [M31R_SLEEP_60, M31R_OFFLINE])):
             with self.subTest(what=what):
-                bus = self.bus({M31R_RECEIVER: [frame]})
-                bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
-                provider = P.PulsarProvider()
-                self.assertGreyed(provider.poll(), 60)
-                self.assertIn("remembered by the receiver: 60%", "\n".join(provider.diagnostics()))
-                # the one power query allowed while offline: asked once, then 60 % is kept
-                self.assertEqual([0x03, 0x04], self.commands(bus))
-                self.assertGreyed(provider.poll(), 60)
-                self.assertGreyed(provider.poll(), 60)
-                self.assertEqual([0x03, 0x04, 0x03, 0x03], self.commands(bus))
-
-    def test_a_remembered_level_does_not_carry_the_charging_flag(self):
-        bus = self.bus({M31R_RECEIVER: [M31R_75_CHARGING]})
-        bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
-        self.assertGreyed(P.PulsarProvider().poll(), 75, charging=False)
-
-    def test_extra_frames_around_the_remembered_level_are_handled(self):
-        bad = bytearray(M31R_OFF_60)
-        bad[16] ^= 0x01
-        for what, frames, level in (
-                ("an extra frame after it", [M31R_OFF_60, M31R_75_CHARGING], 60),
-                ("a bad checksum first", [bytes(bad), M31R_OFF_60], 60),
-                ("an event first", [reply(30, command=0x0A, header=0x09), M31R_OFF_60], 60),
-                ("the online answer repeated first", [M31R_OFFLINE, M31R_OFF_60], 60),
-                ("only a bad checksum", [bytes(bad)], None),
-                ("only an event", [reply(30, command=0x0A, header=0x09)], None),
-                ("nothing", [], None)):
-            with self.subTest(what=what):
-                bus = self.bus({M31R_RECEIVER: frames})
-                bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
-                found = P.PulsarProvider().poll()
-                if level is None:
-                    self.assertOffline(found)
-                else:
-                    self.assertGreyed(found, level)
-
-    def test_a_frame_that_came_with_the_online_answer_is_not_the_remembered_level(self):
-        # the answer drags the 60 % frame along, but the power query gets no reply
-        bus = self.bus({M31R_RECEIVER: []})
-        bus.online[M31R_RECEIVER] = [M31R_OFFLINE, M31R_SLEEP_60]
-        self.assertOffline(P.PulsarProvider().poll())
-
-    def test_a_remembered_level_must_be_1_to_100(self):
-        # a receiver that was only just plugged in remembers nothing: 0 or out of range
-        for level in (0, 101, 255):
-            with self.subTest(level=level):
-                bus = self.bus({M31R_RECEIVER: [with_checksum(M31R_OFF_60, {6: level})]})
-                bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
-                self.assertOffline(P.PulsarProvider().poll())
-        for level in (1, 100):
-            with self.subTest(level=level):
-                bus = self.bus({M31R_RECEIVER: [with_checksum(M31R_OFF_60, {6: level})]})
-                bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
-                self.assertGreyed(P.PulsarProvider().poll(), level)
-
-    def test_with_nothing_remembered_the_power_query_is_made_once_per_offline_stretch(self):
-        bus = self.bus({M31R_RECEIVER: []})
-        bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
-        provider = P.PulsarProvider()
-        self.assertOffline(provider.poll())
-        self.assertOffline(provider.poll())
-        self.assertEqual([0x03, 0x04, 0x03], self.commands(bus))
-        bus.online[M31R_RECEIVER] = [M31R_ONLINE]       # on again, then off again
-        bus.scripts[M31R_RECEIVER] = [M31R_55]
-        self.assertEqual(55, provider.poll()[0].level)
-        bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
-        del bus.sent[:]
-        self.assertGreyed(provider.poll(), 55)          # the live 55, not asked again
-        self.assertEqual([0x03], self.commands(bus))
-
-    def test_an_unclear_online_answer_never_triggers_the_power_query(self):
-        bad = bytearray(M31R_OFFLINE)
-        bad[16] ^= 0x01
-        for what, answer in (("bad checksum", [bytes(bad)]), ("nothing", []),
-                             ("byte 2 set", [with_checksum(M31R_OFFLINE, {2: 1})]),
-                             ("a power frame", [M31R_OFF_60])):
-            with self.subTest(what=what):
-                bus = self.bus({M31R_RECEIVER: [M31R_OFF_60]})
+                bus = self.bus({M31R_RECEIVER: [M31R_OFF_60, M31R_75_CHARGING]})
                 bus.online[M31R_RECEIVER] = answer
-                self.assertOffline(P.PulsarProvider().poll())
-                self.assertEqual([0x03], self.commands(bus))
+                provider = P.PulsarProvider()
+                for _ in range(3):
+                    self.assertEqual([], provider.poll())
+                self.assertEqual([0x03, 0x03, 0x03], self.commands(bus))
 
-    def test_back_online_the_live_value_replaces_the_remembered_one(self):
-        bus = self.bus({M31R_RECEIVER: [M31R_OFF_60]})
+    def test_started_offline_then_online_then_offline_again(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
         bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
         provider = P.PulsarProvider()
-        self.assertGreyed(provider.poll(), 60)
+        self.assertEqual([], provider.poll())
         bus.online[M31R_RECEIVER] = [M31R_ONLINE]
-        bus.scripts[M31R_RECEIVER] = [M31R_55]
         live = provider.poll()
         self.assertEqual((55, False, True), (live[0].level, live[0].charging, live[0].online))
+        bus.online[M31R_RECEIVER] = [M31R_OFFLINE, M31R_SLEEP_60]
+        bus.scripts[M31R_RECEIVER] = [M31R_OFF_60]
+        self.assertGreyed(provider.poll(), 55)           # the live 55, not the remembered 60
+
+    def test_a_pulled_and_replugged_receiver_that_is_offline_shows_nothing(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        provider = P.PulsarProvider()
+        self.assertEqual(55, provider.poll()[0].level)
         bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
         self.assertGreyed(provider.poll(), 55)
+        saved = dict(bus.cols)
+        bus.cols.clear()                                 # the receiver is pulled out
+        self.assertEqual([], provider.poll())
+        self.assertNotIn("pulsar:14a5c009", provider._last)
+        bus.cols.update(saved)                           # and plugged in again, mouse off
+        del bus.sent[:]
+        self.assertEqual([], provider.poll())
+        self.assertEqual([0x03], self.commands(bus))
+        bus.online[M31R_RECEIVER] = [M31R_ONLINE]        # the mouse comes on
+        self.assertEqual((55, True), (provider.poll()[0].level, True))
 
-    def test_a_pulled_receiver_forgets_the_remembered_level(self):
-        bus = self.bus({M31R_RECEIVER: [M31R_OFF_60]})
-        bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
+    # ---- the 300 s limit of the greyed M31R receiver reading (ASLEEP_KEEP, as the other providers)
+
+    def at(self, now):
+        return mock.patch.object(P.time, "time", return_value=now)
+
+    def start_online(self, level_frame=None, at=1000.0):
+        """A receiver read online at `at` (55 %), then its mouse switched off."""
+        bus = self.bus({M31R_RECEIVER: [level_frame or M31R_55]})
         provider = P.PulsarProvider()
-        self.assertGreyed(provider.poll(), 60)
+        with self.at(at):
+            self.assertEqual(55, provider.poll()[0].level)
+        bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
+        return bus, provider
+
+    def test_the_limit_is_the_same_300_s_as_the_other_providers(self):
+        from providers import wlmouse, lamzu, gwolves, razer, nintendo
+        for module in (wlmouse, lamzu, gwolves, razer, nintendo):
+            self.assertEqual(module.ASLEEP_KEEP, P.ASLEEP_KEEP, module.__name__)
+        self.assertEqual(300, P.ASLEEP_KEEP)
+
+    def test_the_greyed_reading_shows_at_299_s_and_not_at_300_or_301_s(self):
+        for when, shown in ((1.0, True), (299.0, True), (299.9, True), (300.0, False),
+                            (301.0, False), (3600.0, False)):
+            with self.subTest(seconds_after_the_reading=when):
+                bus, provider = self.start_online(at=1000.0)
+                with self.at(1000.0 + when):
+                    found = provider.poll()
+                if shown:
+                    self.assertGreyed(found, 55)
+                else:
+                    self.assertEqual([], found)
+                    self.assertNotIn("pulsar:14a5c009", provider._last)
+                self.assertEqual([0x03], self.commands(bus)[-1:], "offline: only 0x03, never 0x04")
+
+    def test_offline_polls_do_not_renew_the_time(self):
+        bus, provider = self.start_online(at=1000.0)
+        for t in (1100.0, 1200.0, 1290.0, 1299.0):      # offline, one poll after another
+            with self.at(t):
+                self.assertGreyed(provider.poll(), 55)
+        with self.at(1301.0):                           # 301 s after the reading, 2 s after a poll
+            self.assertEqual([], provider.poll())
+
+    def test_after_the_limit_it_is_like_a_start_with_the_mouse_off(self):
+        bus, provider = self.start_online(at=1000.0)
+        with self.at(1301.0):
+            self.assertEqual([], provider.poll())
+        self.assertIn("no online reading for 300 s", "\n".join(provider.diagnostics()))
+        with self.at(1302.0):                           # and it stays so, even right after
+            self.assertEqual([], provider.poll())
+        bus.online[M31R_RECEIVER] = [M31R_ONLINE]       # the mouse comes back: live again
+        with self.at(1400.0):
+            live = provider.poll()
+        self.assertEqual((55, True), (live[0].level, live[0].online))
+
+    def test_a_new_online_reading_starts_the_time_again(self):
+        bus, provider = self.start_online(at=1000.0)
+        with self.at(1250.0):
+            self.assertGreyed(provider.poll(), 55)
+        bus.online[M31R_RECEIVER] = [M31R_ONLINE]
+        bus.scripts[M31R_RECEIVER] = [M31R_75_CHARGING]
+        with self.at(1280.0):                           # the mouse is back, 75 %
+            live = provider.poll()
+        self.assertEqual((75, True), (live[0].level, live[0].online))
+        bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
+        with self.at(1578.0):                           # 298 s after the new reading
+            self.assertGreyed(provider.poll(), 75, charging=True)
+        with self.at(1581.0):                           # 301 s after it (331 s after the first)
+            self.assertEqual([], provider.poll())
+
+    def test_an_online_receiver_that_does_not_answer_power_also_expires_at_300_s(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        provider = P.PulsarProvider()
+        with self.at(1000.0):
+            provider.poll()
+        bus.scripts[M31R_RECEIVER] = []                 # online, but the power query is not answered
+        with self.at(1299.0):
+            self.assertGreyed(provider.poll(), 55)
+        with self.at(1301.0):
+            self.assertEqual([], provider.poll())
+
+    def test_a_receiver_pulled_out_is_forgotten_within_the_300_s_too(self):
+        bus, provider = self.start_online(at=1000.0)
         saved = dict(bus.cols)
         bus.cols.clear()
-        self.assertEqual([], provider.poll())
-        bus.cols.update(saved)
-        self.assertGreyed(provider.poll(), 60)
-        self.assertEqual([0x03, 0x04, 0x03, 0x04], self.commands(bus))
+        with self.at(1100.0):
+            self.assertEqual([], provider.poll())
+        bus.cols.update(saved)                          # plugged in again, mouse still off
+        with self.at(1110.0):                           # well inside 300 s of the old reading
+            self.assertEqual([], provider.poll())
 
-    def test_a_greyed_reading_is_not_recorded_nor_alerted(self):
+    # ---- the cable (c010) has no offline state: online with a good reading, nothing otherwise
+
+    CABLE_KEY = "pulsar:14a5c010"
+
+    def start_cable(self, at=1000.0):
+        """The cable read at `at` (70 %, charging); from now on it does not answer."""
+        bus = self.bus({M31R_CABLE: [M31R_70_WIRED]})
+        provider = P.PulsarProvider()
+        with self.at(at):
+            live = provider.poll()
+        self.assertEqual((70, True, True), (live[0].level, live[0].charging, live[0].online))
+        bus.scripts[M31R_CABLE] = []
+        return bus, provider
+
+    def cable_failures(self):
+        """Every way a poll of a plugged-in cable gets no good power reply."""
+        broken = bytearray(M31R_70_WIRED); broken[16] ^= 0xFF           # bad checksum
+        too_high = bytearray(M31R_70_WIRED); too_high[6] = 101           # level out of range
+        return (
+            ("silent", lambda b: b.scripts.update({M31R_CABLE: []})),
+            ("bad checksum", lambda b: b.scripts.update({M31R_CABLE: [bytes(broken)]})),
+            ("level above 100", lambda b: b.scripts.update({M31R_CABLE: [bytes(too_high)]})),
+            ("another command's reply", lambda b: b.scripts.update({M31R_CABLE: [M31R_ONLINE]})),
+            ("send refused", lambda b: b.refuse.add(0x04)),
+            ("feature report refused", lambda b: setattr(b, "refuse_feature", True)),
+            ("reads fail", lambda b: setattr(b, "reads_fail", True)))
+
+    def test_the_m31r_ids_are_split_between_the_300_s_limit_and_no_offline_state(self):
+        self.assertEqual({"pulsar:14a5c009"}, set(P.IROCKS_LIMITED_KEYS))
+        self.assertEqual({"pulsar:14a5c010"}, set(P.IROCKS_NO_OFFLINE_KEYS))
+
+    def test_a_good_cable_reading_is_online_and_is_not_remembered(self):
+        bus, provider = self.start_cable(at=1000.0)
+        self.assertNotIn(self.CABLE_KEY, provider._last)
+        self.assertEqual({}, provider._last)
+
+    def test_a_cable_that_stops_answering_reports_nothing_at_any_time(self):
+        for when in (1.0, 60.0, 299.0, 300.0, 301.0, 3600.0, 86400.0):
+            with self.subTest(seconds_after_the_reading=when):
+                bus, provider = self.start_cable(at=1000.0)
+                with self.at(1000.0 + when):
+                    self.assertEqual([], provider.poll())
+                self.assertEqual({}, provider._last)
+
+    def test_no_failure_of_the_cable_read_ever_gives_online_false(self):
+        for what, setup in self.cable_failures():
+            with self.subTest(what=what):
+                bus, provider = self.start_cable(at=1000.0)
+                setup(bus)
+                for t in (1005.0, 1200.0, 1299.0, 1301.0, 9000.0):
+                    with self.at(t):
+                        found = provider.poll()
+                    self.assertEqual([], found, (what, t))
+                    self.assertEqual({}, provider._last)
+                self.assertIn("nothing reported", "\n".join(provider.diagnostics()))
+
+    def test_the_cable_is_never_asked_online_and_is_asked_for_power_each_poll(self):
+        bus, provider = self.start_cable(at=1000.0)
+        del bus.sent[:]
+        with self.at(1100.0):
+            provider.poll()
+        self.assertEqual([0x04], self.commands(bus))
+
+    def test_a_cable_whose_collections_vanish_but_stays_listed_reports_nothing(self):
+        bus, provider = self.start_cable(at=1000.0)
+        for path, (pid, page, usage) in list(bus.cols.items()):
+            if (page, usage) in (P.IROCKS_COMMAND_USAGE, P.IROCKS_REPLY_USAGE):
+                bus.cols[path] = (pid, 0x0001, 0x0080)
+        for t in (1100.0, 1299.0, 1301.0):
+            with self.at(t):
+                self.assertEqual([], provider.poll())
+        self.assertEqual({}, provider._last)
+
+    def test_the_cable_is_online_again_as_soon_as_it_answers(self):
+        bus, provider = self.start_cable(at=1000.0)
+        for t in (1100.0, 1500.0):
+            with self.at(t):
+                self.assertEqual([], provider.poll())
+        bus.scripts[M31R_CABLE] = [M31R_55]              # answers again (55 %, not charging)
+        with self.at(1510.0):
+            live = provider.poll()
+        self.assertEqual([("pulsar:14a5c010", 55, False, True)],
+                         [(f.key, f.level, f.charging, f.online) for f in live])
+        bus.scripts[M31R_CABLE] = []
+        with self.at(1520.0):                            # and silent again: nothing, no grey
+            self.assertEqual([], provider.poll())
+        self.assertEqual({}, provider._last)
+
+    def test_a_cable_pulled_out_reports_nothing_and_comes_back_when_it_answers(self):
+        bus, provider = self.start_cable(at=1000.0)
+        bus.scripts[M31R_CABLE] = [M31R_70_WIRED]
+        saved = dict(bus.cols)
+        bus.cols.clear()
+        with self.at(1100.0):
+            self.assertEqual([], provider.poll())
+        bus.cols.update(saved)
+        with self.at(1110.0):
+            self.assertEqual([("pulsar:14a5c010", 70, True)],
+                             [(f.key, f.level, f.online) for f in provider.poll()])
+
+    def test_the_receiver_keeps_its_v6_300_s_and_the_cable_has_none(self):
+        bus = self.bus({M31R_RECEIVER: [M31R_55], M31R_CABLE: [M31R_70_WIRED]})
+        provider = P.PulsarProvider()
+        with self.at(1000.0):
+            self.assertEqual(2, len(provider.poll()))
+        bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
+        bus.scripts[M31R_CABLE] = []
+        with self.at(1200.0):                            # only the receiver is greyed
+            self.assertGreyed(provider.poll(), 55)
+        bus.scripts[M31R_CABLE] = [M31R_70_WIRED]        # the cable answers again at 1250
+        with self.at(1250.0):
+            found = {f.key: f for f in provider.poll()}
+        self.assertEqual((55, False), (found["pulsar:14a5c009"].level, found["pulsar:14a5c009"].online))
+        self.assertEqual((70, True), (found["pulsar:14a5c010"].level, found["pulsar:14a5c010"].online))
+        bus.scripts[M31R_CABLE] = []
+        with self.at(1299.0):                            # receiver 299 s: still greyed; cable: nothing
+            self.assertGreyed(provider.poll(), 55)
+        with self.at(1301.0):                            # receiver 301 s: gone, as in v6
+            self.assertEqual([], provider.poll())
+
+    def test_a_silent_cable_does_not_change_other_pulsar_devices_in_the_same_poll(self):
+        # a Pulsar receiver on another vendor id next to a silent M31R cable: it keeps its
+        # greyed reading as long as it is plugged in, the cable reports nothing
+        provider = P.PulsarProvider()
+        bus = self.bus({M31R_CABLE: [M31R_70_WIRED]})
+        other = {"path": b"other", "product_id": 0xF58A, "vendor_id": 0x3554,
+                 "interface_number": 1, "usage_page": 0xFF02, "usage": 0x0002}
+        m31r_enumerate = bus.enumerate
+        P.hidlist = types.SimpleNamespace(
+            enumerate=lambda vid: m31r_enumerate(vid) if vid == P.IROCKS_VID
+            else ([other] if vid == 0x3554 else []))
+        answers = [reply(64)]
+        with mock.patch.object(P.PulsarProvider, "_query", lambda s, path: answers[0]), \
+                mock.patch.object(P.PulsarProvider, "_pick", lambda s, mine: mine[0]), \
+                mock.patch.object(P, "output_length", lambda path: 17):
+            with self.at(1000.0):
+                first = {f.key: f for f in provider.poll()}
+            self.assertEqual({"pulsar:3554f58a", "pulsar:14a5c010"}, set(first))
+            self.assertTrue(all(f.online for f in first.values()))
+            answers[0] = b""
+            bus.scripts[M31R_CABLE] = []
+            with self.at(1000.0 + 86400.0):
+                later = provider.poll()
+        self.assertEqual([("pulsar:3554f58a", 64, False)],
+                         [(f.key, f.level, f.online) for f in later])
+
+    def test_a_pulsar_id_of_vendor_14a5_that_is_not_the_m31r_is_not_limited(self):
+        # the 300 s limit is for c009 only, not for the whole vendor id (nor for c010, which
+        # has no offline state at all)
+        with mock.patch.dict(P.PIDS[P.IROCKS_VID], {0xC011: "iRocks other"}):
+            bus = self.bus({0xC011: [M31R_70_WIRED]})
+            provider = P.PulsarProvider()
+            with self.at(1000.0):
+                self.assertEqual(1, len(provider.poll()))
+            bus.scripts[0xC011] = []
+            for t in (1299.0, 1301.0, 90000.0):
+                with self.at(t):
+                    kept = provider.poll()
+                self.assertEqual([("pulsar:14a5c011", 70, False)],
+                                 [(k.key, k.level, k.online) for k in kept], t)
+
+    def test_a_greyed_reading_is_not_recorded_as_a_new_one(self):
         from halo.history import History
         history = History()
-        # the start-up case: the 60 % is only the receiver's memory
-        bus = self.bus({M31R_RECEIVER: [M31R_OFF_60]})
+        bus = self.bus({M31R_RECEIVER: [M31R_55]})
+        provider = P.PulsarProvider()
+        live = provider.poll()[0]
+        history.record(live.key, live.level, live.charging, live.online, 1000.0)
+        self.assertEqual(1, len(history.devices[live.key]["samples"]))
         bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
-        d = P.PulsarProvider().poll()[0]
-        self.assertFalse(d.online)
-        history.record(d.key, d.level, d.charging, d.online, 1000.0)
-        self.assertEqual([], history.devices[d.key]["samples"])
+        for t in (1060.0, 1120.0):
+            grey = provider.poll()[0]
+            self.assertFalse(grey.online)
+            history.record(grey.key, grey.level, grey.charging, grey.online, t)
+        self.assertEqual(1, len(history.devices[live.key]["samples"]))
 
     def test_a_stale_power_frame_sent_with_the_online_answer_is_not_a_reading(self):
         # online, the power frame (60 %) comes along after the answer and the real battery
@@ -910,33 +1097,32 @@ class M31RTest(unittest.TestCase):
                 if online:
                     self.assertEqual((55, True), (found[0].level, found[0].online))
                 else:
-                    # offline: only the receiver's remembered level, greyed, never live
-                    self.assertGreyed(found, 55)
-                    self.assertEqual([0x03, 0x04], self.commands(bus))
+                    self.assertEqual([], found)          # offline, nothing read before
+                    self.assertEqual([0x03], self.commands(bus))
 
     def test_an_online_answer_with_a_bad_checksum_is_offline(self):
         bad = bytearray(M31R_ONLINE)
         bad[16] ^= 0x01
         bus = self.bus({M31R_RECEIVER: [M31R_55]})
         bus.online[M31R_RECEIVER] = [bytes(bad)]
-        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([], P.PulsarProvider().poll())
         self.assertEqual([0x03], [f[1] for _, f in bus.sent])
 
     def test_an_online_answer_with_byte_2_set_is_offline(self):
         bus = self.bus({M31R_RECEIVER: [M31R_55]})
         bus.online[M31R_RECEIVER] = [with_checksum(M31R_ONLINE, {2: 1})]
-        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([], P.PulsarProvider().poll())
         self.assertEqual([0x03], [f[1] for _, f in bus.sent])
 
     def test_a_power_frame_does_not_answer_the_online_query(self):
         bus = self.bus({M31R_RECEIVER: [M31R_55]})
         bus.online[M31R_RECEIVER] = [M31R_55, M31R_75_CHARGING]
-        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([], P.PulsarProvider().poll())
 
     def test_no_online_answer_is_offline(self):
         bus = self.bus({M31R_RECEIVER: [M31R_55]})
         bus.online[M31R_RECEIVER] = []
-        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([], P.PulsarProvider().poll())
         self.assertEqual([0x03], [f[1] for _, f in bus.sent])
 
     def test_events_and_zero_frames_before_the_online_answer_are_skipped(self):
@@ -947,13 +1133,13 @@ class M31RTest(unittest.TestCase):
     def test_a_refused_online_query_is_offline(self):
         bus = self.bus({M31R_RECEIVER: [M31R_55]})
         bus.refuse = {0x03}
-        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([], P.PulsarProvider().poll())
         self.assertEqual([0x03], [f[1] for _, f in bus.sent])
 
     def test_a_failing_read_of_the_online_answer_is_offline(self):
         bus = self.bus({M31R_RECEIVER: [M31R_55]})
         bus.reads_fail = True
-        self.assertOffline(P.PulsarProvider().poll())
+        self.assertEqual([], P.PulsarProvider().poll())
         self.assertEqual([0x03], [f[1] for _, f in bus.sent])
 
     def test_a_refused_battery_query_of_an_online_mouse_is_not_offline(self):
@@ -965,8 +1151,7 @@ class M31RTest(unittest.TestCase):
         bus = self.bus({M31R_RECEIVER: [M31R_55], M31R_CABLE: [M31R_70_WIRED]})
         bus.online[M31R_RECEIVER] = [M31R_OFFLINE]
         found = {d.key: d for d in P.PulsarProvider().poll()}
-        self.assertEqual((55, False), (found["pulsar:14a5c009"].level,
-                                       found["pulsar:14a5c009"].online))      # greyed
+        self.assertNotIn("pulsar:14a5c009", found)                      # offline: not shown
         self.assertEqual((70, True, True), (found["pulsar:14a5c010"].level,
                                             found["pulsar:14a5c010"].charging,
                                             found["pulsar:14a5c010"].online))
